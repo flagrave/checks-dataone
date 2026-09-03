@@ -1,0 +1,18 @@
+# ------------------------------------------------------------------
+# Datos del cierre. NO se versionan: son cifras internas de Bayer
+# (P&L del SBP, extraccion de SAP BW, entidades legales).
+# ------------------------------------------------------------------
+*.xlsx
+*.xlsm
+*.xlsb
+*.csv
+
+# Archivos de bloqueo que deja Excel cuando el libro esta abierto.
+~$*
+
+# Salidas que generan los scripts: se reconstruyen corriendo el .bat.
+Tablero_SBP2027.html
+
+# Python
+__pycache__/
+*.py[cod]
