@@ -1,19 +1,33 @@
 """
-Check SBP 2027 - IBF
-====================
+Check de carga IBF - Conosur
+============================
 
 Compara lo cargado en SAP BW (hoja `query`) contra la hoja de trabajo
-(hoja `PreFC Y1`) de Checksibf.xlsx, normalizando ambos lados a la misma
+(hoja `PreFC Y1`) del libro del ciclo, normalizando ambos lados a la misma
 granularidad: Country x SBE.1 x SBE.2 x SBE.3 x P&L.
+
+Sirve para los dos ciclos, que se eligen con `--cycle`:
+
+    sbp   SBP 2027, cerrado. Carga anual, sin apertura mensual: se compara
+          la columna `Full Year` de la hoja contra el total de la query.
+    fc3   FC3 2026, el ciclo vivo. La query trae el actual de enero a agosto
+          y el forecast de septiembre a diciembre en el mismo numero, asi que
+          el cruce se abre en dos bloques -Actual y To Go- y cada uno se
+          compara por separado. Ver SECCION 1B.
+
+El nombre del archivo quedo de la primera version (SBP); el script ya no es
+de un ciclo solo.
 
 Las reglas de clasificacion replican el script de Power Query de BASE D1,
 adaptadas a las columnas que trae la extraccion de BW (que no tiene
 `CV Brand Family` ni `Franchise` a nivel detalle).
 
 Uso:
-    py check_sbp.py                      # usa Checksibf.xlsx, escribe Check_SBP2027.xlsx
+    py check_sbp.py                      # ciclo por defecto (fc3)
+    py check_sbp.py --cycle sbp          # el ciclo cerrado
     py check_sbp.py --tol 5              # tolerancia 5 (miles USD)
     py check_sbp.py --grain sbe1         # compara a nivel SBE.1 en vez de SBE.3
+    py check_sbp.py --actual-thru 9      # mueve el corte actual/to go a septiembre
 """
 
 import argparse
@@ -30,7 +44,6 @@ from openpyxl.utils import get_column_letter
 # SECCION 1 - PARAMETROS Y CONFIGURACION
 # ============================================================
 
-BOOK = "Checksibf.xlsx"
 SHEET_QUERY = "query"
 SHEET_WS = "PreFC Y1"
 
@@ -44,6 +57,20 @@ WS_FIRST_DATA_ROW = 3
 # el volumen esta en unidades. De ahi los dos factores distintos.
 SCALE_MONEY = 1.0
 SCALE_VOLUME = 1000.0
+
+# Escala de la hoja de trabajo, por ciclo (`ws_scale` en CYCLES).
+# La columna `Unit` dice "MUSD" y "Kssus" en los dos libros, pero las cifras
+# no estan en la misma escala: el libro del SBP carga miles de USD y unidades,
+# el del FC3 carga millones y miles. La etiqueta no sirve para decidir, asi
+# que el factor va declarado en el ciclo y despues se verifica contra el cruce
+# (ver check_ws_scale): si no da, se avisa en vez de comparar mal.
+WS_SCALE = 1.0
+# Relacion tipica query/hoja a partir de la cual se sospecha de la escala.
+WS_SCALE_MIN, WS_SCALE_MAX = 0.5, 2.0
+# Debajo de esto una linea es ruido y no vota en la mediana.
+WS_SCALE_FLOOR = 10.0
+# La relacion medida en el cruce; la completa check_ws_scale().
+WS_SCALE_MEDIAN = None
 
 # El volumen de GLY viene en otra unidad de medida en la query que en la hoja
 # de trabajo (Regs). La conversion es por SKU: volumen query / factor = Regs.
@@ -68,8 +95,11 @@ DEFAULT_TOL_PCT = 0.0
 # Company code (Auth) -> Country de la hoja de trabajo.
 COCD_TO_COUNTRY = {
     "2601": "ARG",
-    "0164": "CHI",
-    "0197": "PER",
+    "0164": "CHI",   # Bayer Chile (CP y GLY)
+    "2611": "CHI",   # Corn
+    "0197": "PER",   # Bayer Peru (CP)
+    "2690": "PER",   # Corn
+    "1321": "PER",   # GLY
     "1386": "BOL",
     "0194": "UGY",
     "0916": "PGY",  # Bayer Paraguay
@@ -77,9 +107,16 @@ COCD_TO_COUNTRY = {
 }
 
 # Nombre de la entidad legal, para el reporte.
+# Los tres codigos nuevos van con una etiqueta descriptiva hasta que se
+# confirme la razon social; no cambia el cruce, solo el texto del reporte.
 COCD_NAME = {
     "0916": "Bayer Paraguay",
     "2663": "Monsanto Paraguay",
+    "0164": "Bayer Chile",
+    "2611": "Chile - Corn",
+    "0197": "Bayer Peru",
+    "2690": "Peru - Corn",
+    "1321": "Peru - GLY",
 }
 
 # Paises con mas de una entidad legal: que negocio se factura por cual.
@@ -90,6 +127,12 @@ ENTITY_RULES = {
         "Corn": "2663", "SOY": "2663", "GLY": "2663", "OTHERS": "2663",
         "CP": "0916",
     },
+    "PER": {
+        "Corn": "2690", "GLY": "1321", "CP": "0197",
+    },
+    "CHI": {
+        "Corn": "2611", "GLY": "0164", "CP": "0164",
+    },
 }
 
 # Solo se comparan las filas de la hoja de trabajo con este flag.
@@ -98,6 +141,110 @@ WS_INV_DEL_KEEP = {"Del"}
 
 # Columna de la hoja de trabajo que contiene el valor anual.
 WS_VALUE_COL = "Full Year"
+
+# Columnas mensuales de la hoja de trabajo, en orden.
+WS_MONTH_COLS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+# ============================================================
+# SECCION 1B - CICLOS Y APERTURA DE PERIODO
+# ============================================================
+# Un ciclo es un libro, un anio y una forma de partir el anio. El SBP se
+# carga de una sola vez para todo el anio; el FC3 tiene el actual ya cerrado
+# hasta agosto y el to go de septiembre a diciembre, y son dos cosas
+# distintas: que el total cierre no dice nada si el actual esta bien y el
+# forecast mal por el mismo importe con el signo cambiado.
+
+CYCLES = {
+    "sbp": {
+        "label": "SBP 2027",
+        "book": "Checksibf.xlsx",
+        "year": 2027,
+        "split": False,          # carga anual: no hay actual ni to go
+        "actual_thru": None,
+        "ws_scale": 1.0,         # la hoja carga miles de USD y unidades
+        "out_xlsx": "Check_SBP2027.xlsx",
+        "out_html": "Tablero_SBP2027.html",
+    },
+    "fc3": {
+        "label": "FC3 2026",
+        "book": "ChecksibfFC3.xlsx",
+        "year": 2026,
+        "split": True,
+        "actual_thru": 8,        # agosto es el ultimo mes cerrado
+        "ws_scale": 1000.0,      # la hoja carga millones y miles de unidades
+        "out_xlsx": "Check_FC3_2026.xlsx",
+        "out_html": "Tablero_FC3_2026.html",
+    },
+}
+DEFAULT_CYCLE = "fc3"
+
+# Nombres de los dos bloques. Cortos a proposito: son parte de la clave de
+# cruce y encabezan columnas del reporte. El rango de meses de cada uno se
+# arma en period_label() y va en Parametros y en el tablero.
+P_ACTUAL = "Actual"
+P_TOGO = "To Go"
+P_FULLYEAR = "Full Year"   # modo degradado: la query no trae el mes
+
+MONTH_ES = ("Ene", "Feb", "Mar", "Abr", "May", "Jun",
+            "Jul", "Ago", "Sep", "Oct", "Nov", "Dic")
+
+# Estado del ciclo en curso. Se completa en setup_cycle(); el tablero lo lee
+# para saber si tiene que mostrar la dimension Periodo.
+CYCLE = CYCLES[DEFAULT_CYCLE]
+PERIOD_SPLIT = False        # True solo si ademas la query trae el mes
+ACTUAL_THRU = None
+# Se completa al leer la query: como se resolvio la columna de mes y que
+# quedo afuera. Todo esto se reporta; nada se resuelve en silencio.
+PERIOD_COL_NAME = None
+PERIOD_MISSING = False      # la query no trae mes -> se degrada a Full Year
+PERIOD_OTHER_YEAR = {}      # (anio, mes) -> importe de filas de otro anio
+PERIOD_UNPARSED = {}        # valor crudo -> veces que aparecio
+
+
+def setup_cycle(name, actual_thru=None):
+    """Fija el ciclo en curso. Devuelve su configuracion."""
+    global CYCLE, PERIOD_SPLIT, ACTUAL_THRU, WS_SCALE
+    CYCLE = CYCLES[name]
+    ACTUAL_THRU = actual_thru or CYCLE["actual_thru"]
+    PERIOD_SPLIT = bool(CYCLE["split"] and ACTUAL_THRU)
+    WS_SCALE = CYCLE.get("ws_scale", 1.0)
+    return CYCLE
+
+
+def period_of_month(month):
+    """Mes (1-12) -> bloque del ciclo."""
+    if not PERIOD_SPLIT:
+        return P_FULLYEAR
+    return P_ACTUAL if month <= ACTUAL_THRU else P_TOGO
+
+
+def period_label(period):
+    """'Actual' -> 'Actual (Ene-Ago)'. Para titulos y parametros."""
+    if period == P_ACTUAL:
+        return f"Actual ({MONTH_ES[0]}-{MONTH_ES[ACTUAL_THRU - 1]})"
+    if period == P_TOGO:
+        return f"To Go ({MONTH_ES[ACTUAL_THRU]}-{MONTH_ES[11]})"
+    if period == P_FULLYEAR and PERIOD_SPLIT:
+        return f"Full Year ({MONTH_ES[0]}-{MONTH_ES[11]})"
+    return period
+
+
+def periods_in_play():
+    """Bloques que se comparan en este ciclo, en orden de calendario."""
+    return [P_ACTUAL, P_TOGO] if PERIOD_SPLIT else [P_FULLYEAR]
+
+
+def periods_shown():
+    """Bloques que se muestran: los que se cruzan, mas el ano completo.
+
+    El Full Year no es un bloque mas del cruce: es la suma de los otros dos,
+    derivada despues (ver fullyear_recs). Va aparte de periods_in_play() justo
+    por eso -- si entrara ahi, read_worksheet repartiria los meses en tres
+    bloques y el ano se contaria dos veces.
+    """
+    return periods_in_play() + ([P_FULLYEAR] if PERIOD_SPLIT else [])
 
 # --- Tokens de clasificacion (espejo del script M) ---
 CP_TOKENS = ("FUNGICIDES", "HERBICIDES", "INSECTICIDES", "SEEDGROWTH")
@@ -541,21 +688,161 @@ def adjust_volume(value, cv6, mat, sku, sbe3, business, country):
 # SECCION 7 - LECTURA Y NORMALIZACION
 # ============================================================
 
+# --- Resolucion de columnas de la query ---------------------------------
+# Historicamente se leian por posicion, y eso es exactamente lo que se rompe
+# al agregarle el mes a la extraccion: Analysis mete las caracteristicas de
+# fila a la izquierda y corre todo lo demas un lugar. Ahora se resuelven por
+# encabezado, con la posicion fija como respaldo para el layout viejo.
+QUERY_COL_PATTERNS = {
+    "pl":        ("p&l", "p and l", "pyl"),
+    "cocd":      ("company code", "sociedad", "cocd"),
+    "cv6":       ("cv 6", "cv6", "strategic business"),
+    "franchise": ("franchise", "franquicia"),
+    "sku":       ("material", "sku"),
+    "period":    ("month", "mes", "period", "periodo", "calmonth",
+                  "calendar year", "fiscal"),
+}
+QUERY_COLS_LEGACY = {"pl": 0, "cocd": 1, "cv6": 2, "franchise": 3,
+                     "sku": 4, "mat": 5, "period": None}
+QUERY_NCOLS_LEGACY = 7
+
+
+def resolve_query_cols(header):
+    """Encabezado de la query -> indice de cada columna que usa el cruce.
+
+    El valor es siempre la ultima columna: las caracteristicas van a la
+    izquierda y el ratio a la derecha, asi que sumar una caracteristica no lo
+    mueve. La descripcion del material es la columna que sigue al SKU y viene
+    sin encabezado, que es como Analysis muestra clave y texto.
+    """
+    low = [clean_trim(h).lower() for h in header]
+    cols = {}
+    for field, pats in QUERY_COL_PATTERNS.items():
+        for i, h in enumerate(low):
+            if h and any(p in h for p in pats):
+                cols[field] = i
+                break
+
+    faltan = [f for f in ("pl", "cocd", "cv6", "franchise", "sku")
+              if f not in cols]
+    if faltan:
+        # Layout viejo (encabezados en otro idioma o celdas fusionadas): se
+        # cae a las posiciones fijas solo si la grilla es la de siempre.
+        if len(header) == QUERY_NCOLS_LEGACY:
+            return dict(QUERY_COLS_LEGACY), True
+        raise SystemExit(
+            f"No se reconocieron columnas de la hoja '{SHEET_QUERY}': "
+            f"falta {', '.join(faltan)}. Encabezado leido: "
+            f"{[h for h in header if h]!r}. Revisa que el refresh de Analysis "
+            f"haya dejado el encabezado en la fila {QUERY_HEADER_ROW}.")
+
+    cols["mat"] = cols["sku"] + 1
+    cols.setdefault("period", None)
+    return cols, False
+
+
+# --- Lectura del mes ----------------------------------------------------
+MONTH_TOKENS = {
+    "JAN": 1, "ENE": 1, "FEB": 2, "MAR": 3, "APR": 4, "ABR": 4, "MAY": 5,
+    "JUN": 6, "JUL": 7, "AUG": 8, "AGO": 8, "SEP": 9, "SET": 9, "OCT": 10,
+    "NOV": 11, "DEC": 12, "DIC": 12,
+}
+
+
+def parse_period(v, year_default):
+    """Valor de la columna de mes -> (anio, mes). None si no se entiende.
+
+    Analysis escribe el periodo de varias formas segun la caracteristica que
+    se haya puesto en las filas: '08.2026', '2026/08', '202608', 'AUG 2026',
+    y el periodo fiscal como '2026008'. Se aceptan todas; lo que no se
+    entiende se cuenta y se avisa, nunca se adivina.
+    """
+    if v is None or v == "":
+        return None
+    if isinstance(v, dt.datetime) or isinstance(v, dt.date):
+        return v.year, v.month
+
+    s = clean_upper(str(v))
+    if not s:
+        return None
+
+    # Nombre de mes, con o sin anio: 'AUG', 'AUG 2026', 'AGO-26'
+    for tok, m in MONTH_TOKENS.items():
+        if tok in s:
+            y = re.search(r"(20\d{2})", s)
+            return (int(y.group(1)) if y else year_default), m
+
+    # Con separador se leen las partes por lo que son, no concatenadas:
+    # '8.2026' es agosto de 2026 y no el numero 82026.
+    partes = [p for p in re.split(r"[^0-9]+", s) if p]
+    if len(partes) == 2:
+        a, b = (int(p) for p in partes)
+        anio, mes = (a, b) if a > 12 else (b, a)
+        if anio < 100:
+            anio += 2000
+        return (anio, mes) if 1 <= mes <= 12 else None
+
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return None
+    if len(digits) == 7:                       # periodo fiscal YYYY0PP
+        y, m = int(digits[:4]), int(digits[-2:])
+    elif len(digits) == 6:                     # YYYYMM o MMYYYY
+        if 2000 <= int(digits[:4]) <= 2100:
+            y, m = int(digits[:4]), int(digits[4:])
+        else:
+            y, m = int(digits[2:]), int(digits[:2])
+    elif len(digits) in (1, 2, 3):             # posting period suelto: 8, 08, 008
+        y, m = year_default, int(digits)
+    else:
+        return None
+    # Los periodos especiales de cierre (13 a 16) no son un mes: caen como
+    # ilegibles y se avisan, en vez de colarse en el to go.
+    return (y, m) if 1 <= m <= 12 else None
+
+
 def read_query(path):
+    global PERIOD_COL_NAME, PERIOD_MISSING, PERIOD_OTHER_YEAR, PERIOD_UNPARSED
+    PERIOD_OTHER_YEAR, PERIOD_UNPARSED = defaultdict(float), defaultdict(int)
+
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb[SHEET_QUERY]
+    it = ws.iter_rows(min_row=QUERY_HEADER_ROW, values_only=True)
+    header = list(next(it))
+    cols, legacy = resolve_query_cols(header)
+    vcol = len(header) - 1
+    pcol = cols["period"]
+    PERIOD_COL_NAME = clean_trim(header[pcol]) if pcol is not None else None
+    # Sin mes en la query no se puede saber que parte del numero es actual y
+    # que parte es forecast. Antes de inventar un corte, se compara el anual:
+    # una linea sin abrir es mejor que dos desvios inventados.
+    PERIOD_MISSING = PERIOD_SPLIT and pcol is None
+
     rows = []
     unmapped_cocd = set()
-    for r in ws.iter_rows(min_row=QUERY_FIRST_DATA_ROW, values_only=True):
-        pl_raw = clean_trim(r[0])
+    for r in it:
+        pl_raw = clean_trim(r[cols["pl"]])
         if not pl_raw:
             continue
-        cocd = clean_trim(r[1])
-        cv6 = clean_trim(r[2])
-        franchise = clean_trim(r[3])
-        sku = clean_trim(r[4])
-        mat = clean_trim(r[5])
-        val = to_num(r[6])
+        cocd = clean_trim(r[cols["cocd"]])
+        cv6 = clean_trim(r[cols["cv6"]])
+        franchise = clean_trim(r[cols["franchise"]])
+        sku = clean_trim(r[cols["sku"]])
+        mat = clean_trim(r[cols["mat"]])
+        val = to_num(r[vcol])
+
+        # Periodo: fuera del modo split todo cae en un unico bloque.
+        periodo = P_FULLYEAR
+        if PERIOD_SPLIT and pcol is not None:
+            ym = parse_period(r[pcol], CYCLE["year"])
+            if ym is None:
+                PERIOD_UNPARSED[clean_trim(r[pcol])] += 1
+                continue
+            anio, mes = ym
+            if anio != CYCLE["year"]:
+                PERIOD_OTHER_YEAR[(anio, mes)] += val
+                continue
+            periodo = period_of_month(mes)
 
         country = COCD_TO_COUNTRY.get(cocd)
         if country is None:
@@ -579,21 +866,50 @@ def read_query(path):
             val = val * SCALE_MONEY
 
         rows.append({
+            "Periodo": periodo,
             "Country": country, "CoCd": cocd, "SBE": sbe, "SBE.1": sbe1,
             "SBE.2": sbe2, "SBE.3": sbe3, "P&L": pl, "SKU": sku,
             "Material": mat, "CV6": cv6, "Franchise": franchise,
             "Value": val,
         })
     wb.close()
+    if legacy:
+        print(f"Nota         : la hoja '{SHEET_QUERY}' no trae encabezados "
+              f"reconocibles; se leyo por posicion (layout de {QUERY_NCOLS_LEGACY} "
+              f"columnas)")
     return rows, unmapped_cocd
 
 
+# Lineas de la hoja con los doce meses vacios pero con anual cargado: el
+# valor esta ahi pero no se puede repartir entre actual y to go.
+WS_SIN_MESES = {}
+
+
 def read_worksheet(path):
+    """Lee la hoja de trabajo.
+
+    En el ciclo anual devuelve una fila por linea, con la columna `Full Year`.
+    Con apertura de periodo devuelve una fila por linea y por bloque, sumando
+    los meses de cada bloque: ene-ago para el actual, sep-dic para el to go.
+    """
+    global WS_SIN_MESES
+    WS_SIN_MESES = {}
+
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb[SHEET_WS]
     it = ws.iter_rows(min_row=WS_HEADER_ROW, values_only=True)
     header = [clean_trim(c) for c in next(it)]
     idx = {name: i for i, name in enumerate(header) if name}
+
+    por_mes = PERIOD_SPLIT and not PERIOD_MISSING
+    if por_mes:
+        faltan = [m for m in WS_MONTH_COLS if m not in idx]
+        if faltan:
+            raise SystemExit(
+                f"La hoja '{SHEET_WS}' no tiene las columnas mensuales "
+                f"{', '.join(faltan)}, que hacen falta para separar el actual "
+                f"del to go.")
+        mcols = [idx[m] for m in WS_MONTH_COLS]
     vcol = idx[WS_VALUE_COL]
 
     rows = []
@@ -604,7 +920,7 @@ def read_worksheet(path):
         pl = clean_trim(r[idx["P&L"]])
         if pl in WS_PL_IGNORE:
             continue
-        rows.append({
+        base = {
             "Country": clean_trim(r[idx["Country"]]),
             "Inv/Del": inv_del,
             "Responsable": clean_trim(r[idx["Responsable"]]),
@@ -614,10 +930,56 @@ def read_worksheet(path):
             "SBE.3": clean_trim(r[idx["SBE.3"]]),
             "P&L": pl,
             "Unit": clean_trim(r[idx["Unit"]]),
-            "Value": to_num(r[vcol]),
-        })
+        }
+        if not por_mes:
+            rows.append(dict(base, Periodo=P_FULLYEAR,
+                             Value=to_num(r[vcol]) * WS_SCALE))
+            continue
+
+        meses = [to_num(r[c]) * WS_SCALE for c in mcols]
+        anual = to_num(r[vcol]) * WS_SCALE
+        # La carga anual se hace en una sola celda: si eso pasa en el FC3, los
+        # meses quedan en cero y el bloque compara contra nada. Se avisa en vez
+        # de dar por bueno un cero.
+        if not any(meses) and anual:
+            k = (base["Country"], base["SBE.1"], base["SBE.3"], pl)
+            WS_SIN_MESES[k] = WS_SIN_MESES.get(k, 0.0) + anual
+        for p in periods_in_play():
+            val = sum(v for i, v in enumerate(meses, start=1)
+                      if period_of_month(i) == p)
+            rows.append(dict(base, Periodo=p, Value=val))
+
     wb.close()
     return rows
+
+
+def check_ws_scale(recs):
+    """Verifica el factor `ws_scale` del ciclo contra el resultado del cruce.
+
+    Devuelve la relacion tipica query/hoja de las lineas donde los dos lados
+    tienen dato. Si la hoja esta bien escalada esa relacion ronda 1: los
+    desvios reales mueven cada linea, pero no la mediana. Si da 1000 o 0,001,
+    el libro cambio de escala y el cruce entero seria falso -> el que llama
+    avisa. La mediana y no el promedio, justamente para que un par de lineas
+    muy desviadas no la corran.
+    """
+    global WS_SCALE_MEDIAN
+    rat = sorted(r["query"] / r["worksheet"] for r in recs
+                 if abs(r["query"]) > WS_SCALE_FLOOR
+                 and abs(r["worksheet"]) > WS_SCALE_FLOOR)
+    if not rat:
+        WS_SCALE_MEDIAN = None
+    else:
+        n = len(rat)
+        WS_SCALE_MEDIAN = (rat[n // 2] if n % 2
+                           else (rat[n // 2 - 1] + rat[n // 2]) / 2)
+    return WS_SCALE_MEDIAN
+
+
+def ws_scale_sospechosa():
+    """True si la relacion medida no se parece a 1: la escala esta mal."""
+    return (WS_SCALE_MEDIAN is not None
+            and not WS_SCALE_MIN <= WS_SCALE_MEDIAN <= WS_SCALE_MAX)
 
 
 # ============================================================
@@ -634,9 +996,17 @@ GRAINS = {
 SBE3_ALIASES = {"LT": "La Tijereta"}
 
 
+def grain_fields(grain):
+    """Campos de la clave de cruce. El periodo va primero: es el corte de
+    mayor nivel y ordena el reporte por bloque antes que por pais."""
+    if PERIOD_SPLIT and not PERIOD_MISSING:
+        return ("Periodo",) + GRAINS[grain]
+    return GRAINS[grain]
+
+
 def key_of(row, grain, pl_level):
     out = []
-    for f in GRAINS[grain]:
+    for f in grain_fields(grain):
         v = row.get(f, "")
         if f == "SBE.3":
             v = SBE3_ALIASES.get(v, v)
@@ -749,6 +1119,62 @@ def reconcile(qrows, wrows, grain, tol, tol_pct, pl_level):
     return out
 
 
+def fullyear_recs(recs, tol, tol_pct=0.0):
+    """Vista derivada: suma los bloques ya cruzados, clave por clave.
+
+    No es un cruce nuevo -- el actual y el to go ya se compararon cada uno
+    contra su parte de la hoja; esto los suma para poder leer el ano completo,
+    que es como el negocio mira el forecast.
+
+    El estado se recalcula sobre la suma con la misma tolerancia, y ahi esta la
+    trampa: un desvio de mas en el actual y uno de menos en el to go se
+    cancelan, y la linea cierra en el ano estando mal en los dos bloques. Por
+    eso cada registro se lleva `nbad` (bloques que no cerraron): el tablero
+    cuenta cuantas lineas cierran solo por compensacion y lo avisa.
+    """
+    if not PERIOD_SPLIT:
+        return []
+
+    agg = {}
+    for r in recs:
+        k = (P_FULLYEAR,) + tuple(r["key"][1:])
+        a = agg.get(k)
+        if a is None:
+            a = agg[k] = {"query": 0.0, "worksheet": 0.0, "en_q": False,
+                          "en_w": False, "resp": set(), "nbad": 0}
+        a["query"] += r["query"]
+        a["worksheet"] += r["worksheet"]
+        # De que lado existe la clave lo dice el estado de cada bloque: una
+        # clave que falta en la query en los dos sigue faltando en el ano.
+        a["en_q"] = a["en_q"] or r["status"] != "FALTA EN QUERY"
+        a["en_w"] = a["en_w"] or r["status"] != "SOLO EN QUERY"
+        a["nbad"] += 1 if r["status"] != "OK" else 0
+        if r["resp"]:
+            a["resp"].update(r["resp"].split(", "))
+
+    out = []
+    for k in sorted(agg):
+        a = agg[k]
+        qv, wv = a["query"], a["worksheet"]
+        delta = qv - wv
+        base = max(abs(qv), abs(wv))
+        pct = (delta / base * 100.0) if base else 0.0
+        if abs(delta) <= tol or (tol_pct and base and abs(pct) <= tol_pct):
+            status = "OK"
+        elif not a["en_w"]:
+            status = "SOLO EN QUERY"
+        elif not a["en_q"]:
+            status = "FALTA EN QUERY"
+        else:
+            status = "DESVIO"
+        out.append({
+            "key": k, "query": qv, "worksheet": wv, "delta": delta,
+            "pct": pct, "status": status,
+            "resp": ", ".join(sorted(a["resp"])), "nbad": a["nbad"],
+        })
+    return out
+
+
 # ============================================================
 # SECCION 9 - OUTPUT
 # ============================================================
@@ -786,7 +1212,7 @@ def write_sheet(ws, header, rows, numfmt_from=None):
 
 def build_report(recs, grain, qrows, unmapped, path, tol, ent):
     wb = openpyxl.Workbook()
-    fields = list(GRAINS[grain])
+    fields = list(grain_fields(grain))
 
     # --- Desvios ---
     ws = wb.active
@@ -819,20 +1245,56 @@ def build_report(recs, grain, qrows, unmapped, path, tol, ent):
     )
 
     # --- Resumen por pais ---
-    ws3 = wb.create_sheet("Resumen")
+    # Las columnas de la clave se ubican por nombre: con apertura de periodo
+    # la primera ya no es Country.
+    pos = {f: i for i, f in enumerate(fields)}
+    cut = [f for f in ("Periodo", "Country", "P&L") if f in pos]
     agg = defaultdict(lambda: [0.0, 0.0, 0])
     for r in recs:
-        country, pl = r["key"][0], r["key"][-1]
-        a = agg[(country, pl)]
+        a = agg[tuple(r["key"][pos[f]] for f in cut)]
         a[0] += r["query"]
         a[1] += r["worksheet"]
         a[2] += 1 if r["status"] != "OK" else 0
     write_sheet(
-        ws3,
-        ["Country", "P&L", "Query", "Hoja de trabajo", "Desvio",
-         "Lineas con desvio"],
-        [[c, p, round(v[0], 2), round(v[1], 2), round(v[0] - v[1], 2), v[2]]
-         for (c, p), v in sorted(agg.items())],
+        wb.create_sheet("Resumen"),
+        cut + ["Query", "Hoja de trabajo", "Desvio", "Lineas con desvio"],
+        [list(k) + [round(v[0], 2), round(v[1], 2), round(v[0] - v[1], 2), v[2]]
+         for k, v in sorted(agg.items())],
+        numfmt_from=len(cut) + 1,
+    )
+
+    # --- Total del cluster por bloque ---
+    # El numero que se mira primero. Van los dos bloques y ademas el Full Year,
+    # que es la suma de los dos: el ano es lo que se reporta hacia arriba, pero
+    # si el actual cierra de mas y el to go de menos el total anual da bien
+    # igual y tapa las dos puntas. Por eso el ano nunca va solo.
+    wst = wb.create_sheet("Total Conosur")
+    tot = defaultdict(lambda: [0.0, 0.0, 0, 0])
+    for r in recs + fullyear_recs(recs, tol):
+        pl = r["key"][pos["P&L"]]
+        if pl == "Volume":
+            continue   # unidades: no se suman con los importes
+        a = tot[(r["key"][pos["Periodo"]] if "Periodo" in pos else P_FULLYEAR, pl)]
+        a[0] += r["query"]
+        a[1] += r["worksheet"]
+        a[2] += 1 if r["status"] != "OK" else 0
+        a[3] += 1
+    orden = {p: i for i, p in enumerate(periods_shown())}
+    write_sheet(
+        wst,
+        ["Periodo", "P&L", "Query", "Hoja de trabajo", "Desvio", "Desvio %",
+         "Lineas con desvio", "Lineas"],
+        # El % va sobre el mayor de los dos lados, igual que en el resto del
+        # reporte: con la hoja en cero, dividir por ella daria 0% y se leeria
+        # como que cierra.
+        [[period_label(p), pl, round(v[0], 2), round(v[1], 2),
+          round(v[0] - v[1], 2),
+          round((v[0] - v[1]) / max(abs(v[0]), abs(v[1])) * 100, 2)
+          if max(abs(v[0]), abs(v[1])) else 0.0,
+          v[2], v[3]]
+         for (p, pl), v in sorted(tot.items(),
+                                  key=lambda kv: (orden.get(kv[0][0], 9),
+                                                  kv[0][1]))],
         numfmt_from=3,
     )
 
@@ -854,18 +1316,29 @@ def build_report(recs, grain, qrows, unmapped, path, tol, ent):
     ws4 = wb.create_sheet("Query normalizada")
     write_sheet(
         ws4,
-        ["Country", "CoCd", "SBE", "SBE.1", "SBE.2", "SBE.3", "P&L",
-         "SKU", "Material", "CV6", "Franchise", "Valor"],
-        [[r["Country"], r["CoCd"], r["SBE"], r["SBE.1"], r["SBE.2"],
-          r["SBE.3"], r["P&L"], r["SKU"], r["Material"], r["CV6"],
-          r["Franchise"], round(r["Value"], 4)] for r in qrows],
-        numfmt_from=12,
+        ["Periodo", "Country", "CoCd", "SBE", "SBE.1", "SBE.2", "SBE.3",
+         "P&L", "SKU", "Material", "CV6", "Franchise", "Valor"],
+        [[r["Periodo"], r["Country"], r["CoCd"], r["SBE"], r["SBE.1"],
+          r["SBE.2"], r["SBE.3"], r["P&L"], r["SKU"], r["Material"],
+          r["CV6"], r["Franchise"], round(r["Value"], 4)] for r in qrows],
+        numfmt_from=13,
     )
 
     # --- Parametros ---
     ws5 = wb.create_sheet("Parametros")
     params = [
         ["Generado", dt.datetime.now().strftime("%Y-%m-%d %H:%M")],
+        ["Ciclo", f"{CYCLE['label']} ({CYCLE['book']})"],
+        ["Apertura de periodo",
+            " / ".join(period_label(p) for p in periods_in_play())],
+        ["Columna de mes en la query",
+            PERIOD_COL_NAME or ("NO VIENE -> se compara el anual sin abrir "
+                                "actual/to go" if PERIOD_SPLIT else "no aplica")],
+        ["Columna hoja de trabajo",
+            f"suma de {WS_MONTH_COLS[0]}..{WS_MONTH_COLS[-1]} por bloque"
+            if PERIOD_SPLIT and not PERIOD_MISSING else WS_VALUE_COL],
+        ["Lineas de la hoja sin apertura mensual",
+            len(WS_SIN_MESES) or "-"],
         ["Granularidad", grain],
         # Este Excel queda en la escala de origen (miles de USD) para cotejar
         # celda a celda contra la hoja de trabajo. El tablero HTML muestra lo
@@ -874,9 +1347,11 @@ def build_report(recs, grain, qrows, unmapped, path, tol, ent):
         ["Unidad del volumen", "unidades"],
         ["Tolerancia (miles USD)", tol],
         ["Inv/Del comparados", ", ".join(sorted(WS_INV_DEL_KEEP))],
-        ["Columna hoja de trabajo", WS_VALUE_COL],
         ["Escala plata query", SCALE_MONEY],
         ["Escala volumen query", SCALE_VOLUME],
+        ["Escala hoja de trabajo", WS_SCALE],
+        ["Relacion tipica query/hoja",
+            "-" if WS_SCALE_MEDIAN is None else round(WS_SCALE_MEDIAN, 4)],
         ["P&L ignoradas", ", ".join(sorted(WS_PL_IGNORE))],
         ["Volumen GLY", f"convertido a Regs con {len(GLY_FACTORS)} factores "
                         f"por SKU desde {GLY_FACTOR_FILE}"
@@ -895,22 +1370,37 @@ def build_report(recs, grain, qrows, unmapped, path, tol, ent):
 # SECCION 10 - MAIN
 # ============================================================
 
-def main():
-    ap = argparse.ArgumentParser(description="Check SBP 2027 - IBF")
-    ap.add_argument("--book", default=BOOK)
-    ap.add_argument("--out", default=None)
+def add_common_args(ap):
+    """Flags que comparten el check y el tablero."""
+    ap.add_argument("--cycle", default=DEFAULT_CYCLE, choices=sorted(CYCLES),
+                    help="ciclo de planificacion (define libro y apertura)")
+    ap.add_argument("--book", default=None,
+                    help="libro a leer; por defecto, el del ciclo")
+    ap.add_argument("--actual-thru", type=int, default=None, metavar="MES",
+                    help="ultimo mes cerrado (1-12); de ahi en mas es to go")
     ap.add_argument("--grain", default="sbe3", choices=sorted(GRAINS))
     ap.add_argument("--tol", type=float, default=DEFAULT_TOL)
-    ap.add_argument("--tol-pct", type=float, default=DEFAULT_TOL_PCT)
     ap.add_argument("--pl-level", default="group", choices=("group", "sub"),
                     help="group = agrupa las deducciones en 'Sales Adj' "
                          "(como el script M); sub = linea por linea")
+    return ap
+
+
+def main():
+    ap = add_common_args(argparse.ArgumentParser(description="Check de carga IBF"))
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--tol-pct", type=float, default=DEFAULT_TOL_PCT)
     ap.add_argument("--no-volume", action="store_true",
                     help="excluye las lineas de Volume de la comparacion")
     args = ap.parse_args()
 
-    base = os.path.dirname(os.path.abspath(args.book))
-    out = args.out or os.path.join(base, "Check_SBP2027.xlsx")
+    if args.actual_thru is not None and not 1 <= args.actual_thru <= 12:
+        raise SystemExit("--actual-thru tiene que ser un mes entre 1 y 12")
+    cyc = setup_cycle(args.cycle, args.actual_thru)
+    book = args.book or cyc["book"]
+    base = os.path.dirname(os.path.abspath(book))
+    out = args.out or os.path.join(base, cyc["out_xlsx"])
+    print(f"Ciclo        : {cyc['label']}  ({os.path.basename(book)})")
 
     global EXTRA_OVERRIDES, GLY_FACTORS
     EXTRA_OVERRIDES = load_sku_overrides(os.path.join(base, SKU_OVERRIDE_FILE))
@@ -924,8 +1414,10 @@ def main():
         print(f"Factores GLY  : sin tabla ({GLY_FACTOR_FILE} no encontrado), "
               f"el volumen de GLY queda fuera del cruce")
 
-    qrows, unmapped = read_query(args.book)
-    wrows = read_worksheet(args.book)
+    # read_query primero: es la que descubre si la query trae el mes, y de eso
+    # depende como se lee la hoja de trabajo (por meses o por anual).
+    qrows, unmapped = read_query(book)
+    wrows = read_worksheet(book)
     ent = check_entities(qrows)
 
     if args.no_volume:
@@ -938,6 +1430,7 @@ def main():
 
     recs = reconcile(qrows, wrows, args.grain, args.tol, args.tol_pct,
                      args.pl_level)
+    check_ws_scale(recs)
     build_report(recs, args.grain, qrows, unmapped, out, args.tol, ent)
 
     bad = [r for r in recs if r["status"] != "OK"]
@@ -945,6 +1438,43 @@ def main():
     print(f"Hoja trabajo : {len(wrows)} filas")
     print(f"Granularidad : {args.grain}  |  tolerancia {args.tol}")
     print(f"Combinaciones: {len(recs)}   con desvio: {len(bad)}")
+
+    if PERIOD_SPLIT and not PERIOD_MISSING:
+        print(f"Apertura     : {' | '.join(period_label(p) for p in periods_in_play())}"
+              f"  (columna '{PERIOD_COL_NAME}' de la query)")
+    if WS_SCALE != 1.0:
+        print(f"Escala hoja  : x{WS_SCALE:,.0f} (la hoja carga en millones; "
+              f"relacion tipica query/hoja despues de escalar: "
+              f"{WS_SCALE_MEDIAN:,.3f})")
+    if ws_scale_sospechosa():
+        print()
+        print(f"!! La hoja de trabajo parece estar en otra escala: aun aplicando")
+        print(f"   el factor del ciclo (x{WS_SCALE:,.0f}), la relacion tipica")
+        print(f"   query/hoja da {WS_SCALE_MEDIAN:,.4f} y deberia rondar 1. Asi el")
+        print(f"   cruce entero es falso. Revisa en que unidad quedo cargada la")
+        print(f"   hoja y ajusta 'ws_scale' del ciclo '{args.cycle}' en CYCLES.")
+    if PERIOD_MISSING:
+        print()
+        print("!! La hoja 'query' no trae el mes: no se puede separar el actual")
+        print("   del to go y se compara el total del anio contra la suma de los")
+        print("   doce meses de la hoja. Para abrirlo, refresca Analysis con")
+        print("   'Calendar Year/Month' como caracteristica de fila.")
+    if PERIOD_UNPARSED:
+        print(f"!! Mes ilegible en {sum(PERIOD_UNPARSED.values())} fila(s) de la "
+              f"query; quedaron FUERA del cruce: "
+              f"{', '.join(repr(k) for k in sorted(PERIOD_UNPARSED)[:6])}")
+    if PERIOD_OTHER_YEAR:
+        tot = sum(PERIOD_OTHER_YEAR.values())
+        print(f"!! La query trae {len(PERIOD_OTHER_YEAR)} periodo(s) de otro anio "
+              f"que {CYCLE['year']} ({tot:,.2f}); quedaron fuera del cruce: "
+              f"{', '.join(f'{a}.{m:02d}' for a, m in sorted(PERIOD_OTHER_YEAR))}")
+    if WS_SIN_MESES:
+        tot = sum(WS_SIN_MESES.values())
+        print(f"!! Hoja de trabajo: {len(WS_SIN_MESES)} linea(s) con anual "
+              f"cargado y los doce meses vacios ({tot:,.2f}). Sin apertura "
+              f"mensual no entran en ningun bloque:")
+        for k, v in sorted(WS_SIN_MESES.items(), key=lambda kv: -abs(kv[1]))[:10]:
+            print(f"   {k[0]:4} {k[1]:<8} {k[2]:<14} {k[3]:<12} {v:>13,.2f}")
     if not args.no_volume and not GLY_FACTORS:
         print("Nota         : volumen de GLY excluido (falta la tabla de factores)")
     if not args.no_volume and GLY_SIN_FACTOR:

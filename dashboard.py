@@ -1,11 +1,15 @@
 """
-Tablero de control SBP 2027 - IBF
-=================================
+Tablero de control IBF - Conosur
+================================
 
 Genera un HTML autocontenido (sin dependencias, sin servidor) con el cruce
 entre lo cargado en SAP BW y la hoja de trabajo, para compartir con el equipo.
 
-    py dashboard.py
+El ciclo lo define check_sbp.CYCLES: el FC3 abre el cruce en actual y to go,
+el SBP lo compara anual. Todo lo que cambia entre ciclos vive alla.
+
+    py dashboard.py                      # ciclo por defecto (fc3)
+    py dashboard.py --cycle sbp
     py dashboard.py --out Tablero.html --grain sbe3
 """
 
@@ -29,6 +33,8 @@ def build_rows(book, grain, tol, pl_level):
     chk.GLY_FACTORS = chk.load_gly_factors(
         os.path.join(base, chk.GLY_FACTOR_FILE))
 
+    # read_query primero: descubre si la query trae el mes, y de eso depende
+    # como se lee la hoja de trabajo.
     qrows, unmapped = chk.read_query(book)
     wrows = chk.read_worksheet(book)
     ent = chk.check_entities(qrows)
@@ -37,12 +43,14 @@ def build_rows(book, grain, tol, pl_level):
     qrows, wrows, colapsadas = chk.collapse_gly_sin_marca(qrows, wrows)
 
     recs = chk.reconcile(qrows, wrows, grain, tol, 0.0, pl_level)
-    fields = list(chk.GRAINS[grain])
+    chk.check_ws_scale(recs)   # antes de sumar el ano: si no, cada clave pesa doble
+    fields = list(chk.grain_fields(grain))
 
     rows = []
-    for r in recs:
+    for r in recs + chk.fullyear_recs(recs, tol):
         d = dict(zip(fields, r["key"]))
         rows.append({
+            "per": d.get("Periodo", chk.P_FULLYEAR),
             "country": d.get("Country", ""),
             "sbe1": d.get("SBE.1", ""),
             "sbe2": d.get("SBE.2", ""),
@@ -53,6 +61,9 @@ def build_rows(book, grain, tol, pl_level):
             "d": round(r["delta"], 2),
             "s": r["status"],
             "r": r["resp"],
+            # Solo en las filas Full Year: cuantos bloques no cerraron. Sirve
+            # para avisar cuando el ano cierra por compensacion.
+            "nb": r.get("nbad", 0),
         })
 
     meta = {
@@ -60,6 +71,26 @@ def build_rows(book, grain, tol, pl_level):
         "tol": tol,
         "grain": grain,
         "plLevel": pl_level,
+        "ciclo": chk.CYCLE["label"],
+        "libro": os.path.basename(book),
+        # Bloques del ciclo con su etiqueta larga: el filtro y los titulos del
+        # tablero salen de aca, no de una lista escrita a mano en el HTML.
+        # periods_shown incluye el Full Year, que es la suma de los otros dos.
+        "periodos": [{"id": p, "label": chk.period_label(p)}
+                     for p in chk.periods_shown()],
+        "perAnual": chk.P_FULLYEAR,
+        "split": chk.PERIOD_SPLIT and not chk.PERIOD_MISSING,
+        "periodoFalta": chk.PERIOD_MISSING,
+        "periodoCol": chk.PERIOD_COL_NAME,
+        "escalaHoja": chk.WS_SCALE,
+        "escalaSospechosa": chk.ws_scale_sospechosa(),
+        "escalaMediana": (None if chk.WS_SCALE_MEDIAN is None
+                          else round(chk.WS_SCALE_MEDIAN, 4)),
+        "periodoIlegible": sum(chk.PERIOD_UNPARSED.values()),
+        "periodoOtroAnio": [f"{a}.{m:02d}" for a, m
+                            in sorted(chk.PERIOD_OTHER_YEAR)],
+        "sinMeses": [{"k": list(k), "v": round(v, 2)} for k, v in
+                     sorted(chk.WS_SIN_MESES.items(), key=lambda kv: -abs(kv[1]))],
         "glyVol": not chk.GLY_FACTORS,
         "glySinFactor": [
             {"sku": k, "country": v["Country"], "sbe3": v["SBE.3"],
@@ -84,7 +115,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tablero SBP 2027 &middot; Checks IBF</title>
+<title>Tablero &middot; Checks IBF</title>
 <style>
   .viz-root {
     color-scheme: light;
@@ -98,6 +129,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     --border:         rgba(11,11,11,0.10);
     --pos:            #2a78d6;   /* de mas en sistema */
     --neg:            #e34948;   /* falta en sistema  */
+    --serie-sis:      #2a78d6;   /* serie: cargado en sistema */
+    --serie-hoja:     #eb6834;   /* serie: hoja de trabajo    */
     --neutral:        #f0efec;
     --good:           #0ca30c;
     --warning:        #fab219;
@@ -117,6 +150,8 @@ TEMPLATE = r"""<!DOCTYPE html>
       --border:         rgba(255,255,255,0.10);
       --pos:            #3987e5;
       --neg:            #e66767;
+      --serie-sis:      #3987e5;
+      --serie-hoja:     #d95926;
       --neutral:        #383835;
     }
   }
@@ -132,6 +167,8 @@ TEMPLATE = r"""<!DOCTYPE html>
     --border:         rgba(255,255,255,0.10);
     --pos:            #3987e5;
     --neg:            #e66767;
+    --serie-sis:      #3987e5;
+    --serie-hoja:     #d95926;
     --neutral:        #383835;
   }
 
@@ -168,6 +205,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     border-radius: 7px; padding: 5px 9px; cursor: pointer;
   }
   .fgroup { display: flex; align-items: center; }
+  .fgroup[hidden] { display: none; }   /* display:flex le gana a [hidden] */
   .chk { display: flex; align-items: center; gap: 6px; font-size: 13px;
          color: var(--text-secondary); cursor: pointer; }
 
@@ -192,6 +230,20 @@ TEMPLATE = r"""<!DOCTYPE html>
   .chart-sub { font-size: 12px; color: var(--text-secondary); margin: 0 0 14px; }
   svg { display: block; width: 100%; height: auto; overflow: visible; }
   .legend { display: flex; gap: 16px; margin-top: 12px; flex-wrap: wrap; }
+
+  /* --- total conosur: un panel por linea de P&L, cada uno con su escala --- */
+  .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 18px 26px; }
+  .tpanel { min-width: 0; }
+  /* La separacion va bajo el titulo de cada panel y no entre columnas: asi
+     tambien funciona cuando la grilla parte los paneles en varias filas. */
+  .tp-head { display: flex; align-items: baseline; justify-content: space-between;
+             gap: 10px; margin-bottom: 12px; padding-bottom: 8px;
+             border-bottom: 1px solid var(--grid); }
+  .tp-name { font-size: 13px; font-weight: 600; }
+  .tp-foot { font-size: 12px; color: var(--text-secondary); margin-top: 10px; }
+  .tp-foot b { font-weight: 600; color: var(--text-primary);
+               font-variant-numeric: tabular-nums; }
   .lg { display: flex; align-items: center; gap: 7px; font-size: 12px;
         color: var(--text-secondary); }
   .lg i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
@@ -206,6 +258,8 @@ TEMPLATE = r"""<!DOCTYPE html>
   td { padding: 7px 10px; border-bottom: 1px solid var(--grid); color: var(--text-secondary); }
   td.k { color: var(--text-primary); }
   th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  /* Sin apertura de periodo la columna sobra: seria "Full Year" en cada fila. */
+  body.sin-periodo .c-per { display: none; }
   tbody tr:hover td { background: var(--plane); }
   .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px;
           font-weight: 600; padding: 2px 8px; border-radius: 999px;
@@ -249,7 +303,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 
   <header class="top">
     <div>
-      <h1>Carga SBP 2027 vs hoja de trabajo</h1>
+      <h1 id="titulo">Carga vs hoja de trabajo</h1>
       <p class="sub" id="subtitle"></p>
     </div>
     <button class="btn" id="theme">Modo oscuro</button>
@@ -258,6 +312,8 @@ TEMPLATE = r"""<!DOCTYPE html>
   <div id="warn"></div>
 
   <div class="filters">
+    <div class="fgroup" id="g-per" hidden><label for="f-per">Per&iacute;odo</label>
+      <select id="f-per"></select></div>
     <div class="fgroup"><label for="f-pl">L&iacute;nea P&amp;L</label>
       <select id="f-pl"></select></div>
     <div class="fgroup"><label for="f-country">Pa&iacute;s</label>
@@ -268,6 +324,8 @@ TEMPLATE = r"""<!DOCTYPE html>
       <select id="f-resp"></select></div>
     <label class="chk"><input type="checkbox" id="f-dev"> Solo l&iacute;neas con desv&iacute;o</label>
   </div>
+
+  <div id="per-note"></div>
 
   <div class="kpis">
     <div class="card">
@@ -295,6 +353,13 @@ TEMPLATE = r"""<!DOCTYPE html>
       <div class="tile-val" id="k-n"></div>
       <div class="tile-note" id="k-n-note"></div>
     </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <p class="chart-title" id="c-total-title">Total Conosur</p>
+    <p class="chart-sub" id="c-total-sub"></p>
+    <div class="totals" id="c-total"></div>
+    <div class="legend" id="lg-total"></div>
   </div>
 
   <div class="grid2">
@@ -325,6 +390,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <div class="scroll">
       <table>
         <thead><tr>
+          <th class="c-per">Per&iacute;odo</th>
           <th>Pa&iacute;s</th><th>Negocio</th><th>SBE.2</th><th>SBE.3</th><th>P&amp;L</th>
           <th class="num">Sistema</th><th class="num">Hoja</th><th class="num">Desv&iacute;o</th>
           <th>Estado</th><th>Resp.</th>
@@ -395,8 +461,22 @@ function setVal(id, txt, u) {
   el.appendChild(s);
 }
 
-const state = {pl: "Net Sales", country: "Todos", sbe1: "Todos",
+/* El periodo no tiene opcion "todos": el tablero mira un bloque por vez, y el
+   total del cluster los muestra a todos, siempre. El ano completo si esta,
+   pero como un bloque mas (Full Year = actual + to go, ya cruzados) y con su
+   propio aviso: ahi un desvio de mas en el actual tapa uno de menos en el to
+   go. En un ciclo sin apertura queda en "Todos" y la clausula no filtra nada. */
+const state = {per: "Todos", pl: "Net Sales", country: "Todos", sbe1: "Todos",
                resp: "Todos", dev: false};
+
+// id del bloque -> etiqueta con su rango de meses ("Actual (Ene-Ago)").
+const PER_LABEL = Object.fromEntries(META.periodos.map(p => [p.id, p.label]));
+const PER_ORDER = META.periodos.map(p => p.id);
+const perLabel = (p) => PER_LABEL[p] || p;
+// Todo lo que no es el total del cluster mira un bloque por vez: cada titulo
+// lo dice, para que una captura suelta no se lea como el ano entero.
+const perSuf = () => (META.split ? ` · ${perLabel(state.per)}` : "");
+const esAnual = () => META.split && state.per === META.perAnual;
 
 /* ---------- filtros ---------- */
 function uniq(key) {
@@ -415,13 +495,18 @@ function fillSelect(id, opts, val) {
 }
 // "Todas" agrupa solo los importes: sumar unidades de volumen con millones de
 // USD no significa nada, asi que Volume se mira siempre por separado.
+// matchDims se usa aparte para contar lineas que el filtro de solo-desvios
+// esconde (las que cierran en el ano y no en los bloques).
+function matchDims(r) {
+  return (state.pl === "Todas" ? r.pl !== "Volume" : r.pl === state.pl) &&
+         (state.country === "Todos" || r.country === state.country) &&
+         (state.sbe1 === "Todos" || r.sbe1 === state.sbe1) &&
+         (state.resp === "Todos" || (r.r || "").split(", ").includes(state.resp));
+}
 function filtered() {
   return DATA.filter(r =>
-    (state.pl === "Todas" ? r.pl !== "Volume" : r.pl === state.pl) &&
-    (state.country === "Todos" || r.country === state.country) &&
-    (state.sbe1 === "Todos" || r.sbe1 === state.sbe1) &&
-    (state.resp === "Todos" || (r.r || "").split(", ").includes(state.resp)) &&
-    (!state.dev || r.s !== "OK"));
+    (state.per === "Todos" || r.per === state.per) &&
+    matchDims(r) && (!state.dev || r.s !== "OK"));
 }
 
 /* ---------- tooltip ---------- */
@@ -582,11 +667,11 @@ function niceMax(m) {
   return 10 * p;
 }
 
-function legend(id) {
+function legend(id, items) {
   const el = document.getElementById(id);
   el.textContent = "";
-  const items = [["De más en sistema", "--pos"],
-                 ["Falta en sistema", "--neg"]];
+  items = items || [["De más en sistema", "--pos"],
+                    ["Falta en sistema", "--neg"]];
   for (const [txt, v] of items) {
     const d = document.createElement("span"); d.className = "lg";
     const i = document.createElement("i"); i.style.background = css(v);
@@ -595,14 +680,212 @@ function legend(id) {
   }
 }
 
+/* ---------- barras apareadas: sistema vs hoja, una linea de P&L ----------
+   Net Sales y Sales Adj no comparten ni magnitud ni signo, asi que cada
+   linea va en su propio panel con su propia escala. Un solo eje por panel:
+   dos escalas en un mismo grafico harian ver como parejas cosas que no lo son. */
+function pairedBars(host, series, u, cat) {
+  const BAND = 30, BAR = 18, GAP_R = 4, LABEL_W = 106, GUTTER = 84;
+  // Los dos totales difieren en la cuarta cifra: con la precision corta del
+  // resto del tablero se leerian iguales y el desvio del pie no cerraria.
+  const lab = v => (v < 0 ? samt(v, u, true) : amt(v, u, true));
+  const vals = series.map(s => s.value);
+  const lo = Math.min(0, ...vals), hi = Math.max(0, ...vals);
+  const span = niceMax(Math.max(...vals.map(Math.abs), u.money ? 0.01 : 1));
+  const d0 = lo < 0 ? -span : 0, d1 = hi > 0 ? span : 0;
+
+  const padL = LABEL_W + 12 + (lo < 0 ? GUTTER : 0);
+  const padR = (hi > 0 ? GUTTER : 22);   // la linea del cero nunca pegada al borde
+  const padT = 4, padB = 4;
+  const W = Math.max(host.clientWidth || 380, LABEL_W + 12 + GUTTER + 110);
+  const H = padT + series.length * BAND + padB;
+  const plotW = W - padL - padR;
+  const x = v => padL + ((v - d0) / (d1 - d0)) * plotW;
+
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label",
+    `${cat}: ${series.map(s => `${s.name} ${lab(s.value)} ${u.name}`).join(", ")}`);
+
+  const zero = document.createElementNS(NS, "line");
+  zero.setAttribute("x1", x(0)); zero.setAttribute("x2", x(0));
+  zero.setAttribute("y1", padT); zero.setAttribute("y2", H - padB);
+  zero.setAttribute("stroke", css("--axis")); zero.setAttribute("stroke-width", "1");
+  svg.appendChild(zero);
+
+  const tipRows = series.map(s => [s.name, lab(s.value), css(s.token)]);
+  const delta = series[0].value - series[1].value;
+  tipRows.push(["desvío (sistema − hoja)", samt(delta, u, true), null]);
+
+  series.forEach((s, i) => {
+    const y = padT + i * BAND + (BAND - BAR) / 2;
+    const pos = s.value >= 0;
+    const p = document.createElementNS(NS, "path");
+    p.setAttribute("d", barPath(x(0), x(s.value), y, BAR, GAP_R));
+    p.setAttribute("fill", css(s.token));
+    svg.appendChild(p);
+
+    const lb = document.createElementNS(NS, "text");
+    lb.setAttribute("x", LABEL_W); lb.setAttribute("y", y + BAR / 2 + 4);
+    lb.setAttribute("text-anchor", "end"); lb.setAttribute("font-size", "12");
+    lb.setAttribute("fill", css("--text-primary"));
+    lb.textContent = s.name;
+    svg.appendChild(lb);
+
+    const vl = document.createElementNS(NS, "text");
+    vl.setAttribute("x", x(s.value) + (pos ? 8 : -8));
+    vl.setAttribute("y", y + BAR / 2 + 4);
+    vl.setAttribute("text-anchor", pos ? "start" : "end");
+    vl.setAttribute("font-size", "11.5");
+    vl.setAttribute("fill", css("--text-secondary"));
+    vl.style.fontVariantNumeric = "tabular-nums";
+    vl.textContent = lab(s.value);
+    svg.appendChild(vl);
+
+    const hit = document.createElementNS(NS, "rect");
+    hit.setAttribute("x", 0); hit.setAttribute("y", padT + i * BAND);
+    hit.setAttribute("width", W); hit.setAttribute("height", BAND);
+    hit.setAttribute("fill", "transparent");
+    hit.setAttribute("tabindex", "0"); hit.setAttribute("role", "listitem");
+    hit.setAttribute("aria-label", `${cat} · ${s.name}: ${lab(s.value)} ${u.name}`);
+    const show = e => { p.setAttribute("opacity", ".72"); showTip(e, cat, tipRows); };
+    const hide = () => { p.setAttribute("opacity", "1"); hideTip(); };
+    hit.addEventListener("pointerenter", show);
+    hit.addEventListener("pointermove", moveTip);
+    hit.addEventListener("pointerleave", hide);
+    hit.addEventListener("focus", () => {
+      const r = hit.getBoundingClientRect();
+      show({clientX: r.left + r.width / 2, clientY: r.top + r.height});
+    });
+    hit.addEventListener("blur", hide);
+    svg.appendChild(hit);
+  });
+
+  host.appendChild(svg);
+}
+
+/* ---------- total del cluster ----------
+   El numero que se mira primero: cuanto quedo cargado en el sistema contra
+   cuanto pide la hoja, sumando todo el cluster. Sigue los filtros de pais,
+   negocio y responsable, pero no el de linea de P&L (las muestra todas), ni el
+   de periodo (muestra todos los bloques) ni el de solo desvios: un total
+   parcial no es un total. Volume queda afuera: son unidades y sumarlas con
+   importes no da nada. Con el ciclo abierto cada bloque tiene su propio panel
+   -- el actual, el to go y el ano completo -- para poder leer el total del ano
+   sin perder de vista de que bloque sale. */
+const TOTAL_ORDER = ["Net Sales", "Sales Adj"];
+const SEP = "␟";   // separador interno periodo/linea, no se muestra
+
+function renderTotals() {
+  const host = document.getElementById("c-total");
+  host.textContent = "";
+  const u = UNIT_MONEY, sc = v => v * u.k;
+
+  const rows = DATA.filter(r =>
+    r.pl !== "Volume" &&
+    (state.country === "Todos" || r.country === state.country) &&
+    (state.sbe1 === "Todos" || r.sbe1 === state.sbe1) &&
+    (state.resp === "Todos" || (r.r || "").split(", ").includes(state.resp)));
+
+  const split = META.split;   // un panel por periodo x linea de P&L
+  const scope = state.country === "Todos" ? "Conosur" : state.country;
+  document.getElementById("c-total-title").textContent =
+    `Total ${scope} · sistema vs hoja de trabajo` +
+    (state.sbe1 === "Todos" ? "" : ` · ${state.sbe1}`) +
+    (state.resp === "Todos" ? "" : ` · ${state.resp}`);
+  document.getElementById("c-total-sub").textContent =
+    (split ? "Un panel por bloque y el año completo, que es la suma de los dos " +
+             "(no sigue el filtro de período). " : "") +
+    `Cada línea de P&L con su propia escala, en ${u.name}. No incluye Volume: ` +
+    "son unidades y no se pueden sumar con los importes. Este bloque muestra " +
+    "todas las líneas de importe, sin seguir el filtro de P&L ni el de solo desvíos.";
+
+  const agg = groupBy(rows, r => (split ? r.per + SEP : "") + r.pl);
+  const rank = (k) => {
+    const [a, b] = k.includes(SEP) ? k.split(SEP) : ["", k];
+    const ip = PER_ORDER.indexOf(a), il = TOTAL_ORDER.indexOf(b);
+    return [(ip < 0 ? 99 : ip), (il < 0 ? 99 : il), b];
+  };
+  const lines = [...agg.keys()].sort((a, b) => {
+    const ra = rank(a), rb = rank(b);
+    return ra[0] - rb[0] || ra[1] - rb[1] || ra[2].localeCompare(rb[2]);
+  });
+
+  if (!lines.length) {
+    const p = document.createElement("p");
+    p.className = "empty"; p.textContent = "Sin datos para este filtro.";
+    host.appendChild(p);
+    legend("lg-total", TOTAL_LEGEND);
+    return;
+  }
+
+  const panels = [];
+  for (const key of lines) {
+    const v = agg.get(key);
+    const titulo = key.split(SEP).join(" · ");
+    const panel = document.createElement("div");
+    panel.className = "tpanel";
+
+    const head = document.createElement("div");
+    head.className = "tp-head";
+    const name = document.createElement("span");
+    name.className = "tp-name"; name.textContent = titulo;
+    head.appendChild(name);
+    // El total cierra o no cierra contra la misma tolerancia que cada linea.
+    const ok = Math.abs(v.d) <= META.tol;
+    const [tok, icon, label] = ok ? CHIP["OK"] : CHIP["DESVIO"];
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    const b = document.createElement("b");
+    b.textContent = icon; b.style.color = css(tok);
+    chip.appendChild(b);
+    chip.appendChild(document.createTextNode(ok ? "Cierra" : label));
+    head.appendChild(chip);
+    panel.appendChild(head);
+
+    const plot = document.createElement("div");
+    panel.appendChild(plot);
+
+    const foot = document.createElement("div");
+    foot.className = "tp-foot";
+    const pct = v.w ? (v.d / Math.abs(v.w)) * 100 : null;
+    const strong = document.createElement("b");
+    strong.textContent = `${samt(sc(v.d), u, true)} ${u.suf}`;
+    foot.appendChild(document.createTextNode("Desvío "));
+    foot.appendChild(strong);
+    foot.appendChild(document.createTextNode(
+      (pct === null ? "" : ` · ${sign(pct)}${fmt(Math.abs(pct), 2)}% de la hoja`) +
+      ` · ${v.n} de ${v.lines} línea(s) con desvío`));
+    panel.appendChild(foot);
+
+    host.appendChild(panel);
+    panels.push([plot, titulo, v]);
+  }
+
+  // El ancho del SVG sale del contenedor ya montado: 1 unidad = 1 px.
+  for (const [plot, titulo, v] of panels) {
+    pairedBars(plot, [
+      {name: "Cargado en sistema", value: sc(v.q), token: "--serie-sis"},
+      {name: "Hoja de trabajo", value: sc(v.w), token: "--serie-hoja"},
+    ], u, `${scope} · ${titulo}`);
+  }
+  legend("lg-total", TOTAL_LEGEND);
+}
+
+const TOTAL_LEGEND = [["Cargado en sistema (SAP BW)", "--serie-sis"],
+                      ["Hoja de trabajo (PreFC Y1)", "--serie-hoja"]];
+
 /* ---------- agregacion ---------- */
 function groupBy(rows, keyFn) {
   const m = new Map();
   for (const r of rows) {
     for (const k of [].concat(keyFn(r))) {
       if (!k) continue;
-      const a = m.get(k) || {q: 0, w: 0, d: 0, n: 0};
-      a.q += r.q; a.w += r.w; a.d += r.d; a.n += r.s !== "OK" ? 1 : 0;
+      const a = m.get(k) || {q: 0, w: 0, d: 0, n: 0, lines: 0};
+      a.q += r.q; a.w += r.w; a.d += r.d;
+      a.n += r.s !== "OK" ? 1 : 0; a.lines += 1;
       m.set(k, a);
     }
   }
@@ -616,6 +899,30 @@ const CHIP = {
   "FALTA EN QUERY": ["--critical", "✕", "Falta en sistema"],
   "SOLO EN QUERY":  ["--warning",  "!",      "Solo en sistema"],
 };
+
+/* El Full Year es la suma de los dos bloques, asi que un desvio de mas en el
+   actual y uno de menos en el to go se cancelan y la linea cierra estando mal
+   de las dos puntas. No se puede evitar -- es lo que significa mirar el ano --
+   pero si se puede contar: `nb` trae cuantos bloques no cerraron. */
+function renderPerNote() {
+  const host = document.getElementById("per-note");
+  host.textContent = "";
+  if (!esAnual()) return;
+
+  const fy = DATA.filter(r => r.per === META.perAnual && matchDims(r));
+  const tapadas = fy.filter(r => r.s === "OK" && r.nb > 0).length;
+  const box = document.createElement("div");
+  box.className = "warnbox";
+  box.appendChild(document.createTextNode(
+    "⚠  Full Year = actual + to go sumados, línea por línea. " +
+    (tapadas
+      ? `${tapadas} línea(s) cierran en el año pero tienen desvío en algún ` +
+        "bloque: se compensan entre sí. Mirá el actual y el to go por separado " +
+        "antes de darlas por buenas."
+      : "Ninguna línea cierra en el año por compensación entre bloques: lo que " +
+        "cierra acá, cierra también en el actual y en el to go.")));
+  host.appendChild(box);
+}
 
 /* ---------- render ---------- */
 function render() {
@@ -645,6 +952,9 @@ function render() {
     paises.size ? `${paises.size} país${paises.size > 1 ? "es" : ""} afectado${paises.size > 1 ? "s" : ""}`
                 : "Todo conciliado";
 
+  renderPerNote();
+  renderTotals();
+
   // por pais
   const byC = [...groupBy(rows, r => r.country)]
     .map(([k, v]) => ({label: k, tip: k, value: sc(v.d), q: sc(v.q), w: sc(v.w),
@@ -653,7 +963,7 @@ function render() {
     .sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
   divergingBars("c-pais", byC, {labelW: 60, u, aria: "Desvío por país"});
   document.getElementById("c-pais-sub").textContent =
-    `Sistema menos hoja de trabajo, en ${u.name}`;
+    `Sistema menos hoja de trabajo, en ${u.name}${perSuf()}`;
   legend("lg-pais");
 
   // por responsable
@@ -665,7 +975,7 @@ function render() {
     .sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
   divergingBars("c-resp", byR, {labelW: 60, u, aria: "Desvío por responsable"});
   document.getElementById("c-resp-sub").textContent =
-    `A quién hay que avisar, ordenado por impacto, en ${u.name}`;
+    `A quién hay que avisar, ordenado por impacto, en ${u.name}${perSuf()}`;
   legend("lg-resp");
 
   // top lineas
@@ -678,7 +988,7 @@ function render() {
   document.getElementById("c-linea-sub").textContent =
     `Las ${top.length} combinaciones de mayor impacto` +
     (state.pl === "Todas" ? " (todas las líneas de importe)" : ` · ${state.pl}`) +
-    `, en ${u.name}`;
+    `, en ${u.name}${perSuf()}`;
   legend("lg-linea");
 
   // tabla
@@ -687,8 +997,8 @@ function render() {
   const sorted = rows.slice().sort((a, b) => Math.abs(b.d) - Math.abs(a.d));
   for (const r of sorted) {
     const tr = document.createElement("tr");
-    for (const [v, cls] of [[r.country, "k"], [r.sbe1, ""], [r.sbe2, ""],
-                            [r.sbe3, ""], [r.pl, ""]]) {
+    for (const [v, cls] of [[r.per, "c-per"], [r.country, "k"], [r.sbe1, ""],
+                            [r.sbe2, ""], [r.sbe3, ""], [r.pl, ""]]) {
       const td = document.createElement("td");
       td.className = cls; td.textContent = v; tr.appendChild(td);
     }
@@ -715,17 +1025,41 @@ function render() {
     tb.appendChild(tr);
   }
   document.getElementById("t-sub").textContent =
-    `${sorted.length} línea(s), ordenadas por impacto, en ${u.name}. ` +
+    `${sorted.length} línea(s), ordenadas por impacto, en ${u.name}${perSuf()}. ` +
     `Es la vista de tabla del tablero: todo valor de los gráficos está acá.`;
 }
 
 /* ---------- init ---------- */
 function init() {
+  document.title = `Tablero ${META.ciclo} · Checks IBF`;
+  document.getElementById("titulo").textContent =
+    `${META.ciclo} · carga vs hoja de trabajo`;
   document.getElementById("subtitle").textContent =
     `Cruce de la query de SAP BW contra PreFC Y1 · granularidad ${META.grain.toUpperCase()} · ` +
+    (META.split ? "actual y to go por separado, más el año completo · " : "") +
     `tolerancia ${META.tol} · generado el ${META.generado}`;
+  document.body.classList.toggle("sin-periodo", !META.split);
 
   const notes = [];
+  if (META.escalaSospechosa) notes.push(
+    `La hoja de trabajo parece estar en otra escala: aun aplicando el factor del ` +
+    `ciclo (×${fmt(META.escalaHoja)}), la relación típica entre el sistema y la hoja ` +
+    `da ${fmt(META.escalaMediana, 4)} en vez de rondar 1. Mientras eso no se ` +
+    "corrija, todos los desvíos de este tablero son falsos.");
+  if (META.periodoFalta) notes.push(
+    "La query no trae el mes, así que el actual y el to go no se pueden separar: " +
+    "el cruce quedó a nivel año completo. Para abrirlo, agregá 'Calendar Year/Month' " +
+    "(o el período contable) como característica de fila en Analysis y refrescá el libro.");
+  if (META.periodoIlegible) notes.push(
+    `${META.periodoIlegible} fila(s) de la query tienen un período que no se pudo leer ` +
+    "(períodos especiales 13-16, celdas vacías). Están fuera del cruce.");
+  if (META.periodoOtroAnio && META.periodoOtroAnio.length) notes.push(
+    `La query trae períodos de otro año (${META.periodoOtroAnio.join(", ")}): ` +
+    "esas filas quedaron fuera del cruce.");
+  if (META.sinMeses && META.sinMeses.length) notes.push(
+    `${META.sinMeses.length} línea(s) de la hoja de trabajo tienen el Full Year cargado ` +
+    "pero los doce meses vacíos: no se pueden repartir entre actual y to go y quedan " +
+    "fuera del cruce.");
   if (META.glyVol) notes.push(
     "El volumen de GLY está excluido del cruce: la query lo trae en otra unidad de medida " +
     "y no se encontró la tabla FactoresGly.xlsx para convertirlo a Regs.");
@@ -755,6 +1089,13 @@ function init() {
     document.getElementById("warn").appendChild(box);
   }
 
+  // El filtro de periodo solo aparece si el ciclo esta abierto: en un ciclo
+  // anual seria un desplegable de una sola opcion.
+  if (META.split) {
+    state.per = PER_ORDER[0];
+    document.getElementById("g-per").hidden = false;
+    fillSelect("f-per", META.periodos.map(p => [p.id, p.label]), state.per);
+  }
   fillSelect("f-pl", [["Todas", "Todos los importes"], ...uniq("pl")], state.pl);
   fillSelect("f-country", ["Todos", ...uniq("country")], state.country);
   fillSelect("f-sbe1", ["Todos", ...uniq("sbe1")], state.sbe1);
@@ -765,6 +1106,7 @@ function init() {
     .addEventListener("change", e => { state[key] = e.target.value; render(); });
   bind("f-pl", "pl"); bind("f-country", "country");
   bind("f-sbe1", "sbe1"); bind("f-resp", "resp");
+  if (META.split) bind("f-per", "per");
   document.getElementById("f-dev").addEventListener("change", e => {
     state.dev = e.target.checked; render();
   });
@@ -788,8 +1130,15 @@ function init() {
     "Importes en millones de USD: la query y la hoja de trabajo los traen divididos " +
     "por 1000 (miles de USD) para armar los reportes, acá se muestran en la magnitud " +
     "real del negocio. El volumen queda en unidades y se mira por separado. " +
-    "Desvío = sistema − hoja de trabajo. Fuente: Checksibf.xlsx, hojas query y " +
-    "PreFC Y1. Generado por check_sbp.py / dashboard.py.";
+    "Desvío = sistema − hoja de trabajo. " +
+    (META.split
+      ? "El actual y el to go se cruzan por separado, cada uno contra su parte " +
+        "de la hoja; el Full Year los suma después de cruzados, para leer el año. " : "") +
+    (META.escalaHoja !== 1
+      ? `La hoja de trabajo viene en millones y se multiplica por ${fmt(META.escalaHoja)} ` +
+        "para leerla en la misma escala que la query. " : "") +
+    `Fuente: ${META.libro}, hojas query y PreFC Y1. ` +
+    "Generado por check_sbp.py / dashboard.py.";
 }
 init();
 </script>
@@ -799,18 +1148,20 @@ init();
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Tablero SBP 2027")
-    ap.add_argument("--book", default=chk.BOOK)
+    ap = chk.add_common_args(
+        argparse.ArgumentParser(description="Tablero de control IBF"))
     ap.add_argument("--out", default=None)
-    ap.add_argument("--grain", default="sbe3", choices=sorted(chk.GRAINS))
-    ap.add_argument("--tol", type=float, default=chk.DEFAULT_TOL)
-    ap.add_argument("--pl-level", default="group", choices=("group", "sub"))
     args = ap.parse_args()
 
-    base = os.path.dirname(os.path.abspath(args.book))
-    out = args.out or os.path.join(base, "Tablero_SBP2027.html")
+    if args.actual_thru is not None and not 1 <= args.actual_thru <= 12:
+        raise SystemExit("--actual-thru tiene que ser un mes entre 1 y 12")
+    cyc = chk.setup_cycle(args.cycle, args.actual_thru)
+    book = args.book or cyc["book"]
+    base = os.path.dirname(os.path.abspath(book))
+    out = args.out or os.path.join(base, cyc["out_html"])
+    print(f"Ciclo             : {cyc['label']}  ({os.path.basename(book)})")
 
-    rows, meta = build_rows(args.book, args.grain, args.tol, args.pl_level)
+    rows, meta = build_rows(book, args.grain, args.tol, args.pl_level)
     doc = (TEMPLATE
            .replace("__DATA__", json.dumps(rows, ensure_ascii=False))
            .replace("__META__", json.dumps(meta, ensure_ascii=False)))
@@ -818,9 +1169,22 @@ def main():
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(doc)
 
-    dev = [r for r in rows if r["s"] != "OK"]
-    print(f"Lineas de control : {len(rows)}")
+    # El Full Year es una vista derivada: no suma lineas de control, las repite
+    # sumadas. Se cuenta aparte para no inflar el total.
+    cruce = [r for r in rows
+             if not (meta["split"] and r["per"] == chk.P_FULLYEAR)]
+    dev = [r for r in cruce if r["s"] != "OK"]
+    print(f"Lineas de control : {len(cruce)}")
     print(f"Con desvio        : {len(dev)}")
+    if meta["split"]:
+        for p in chk.periods_shown():
+            sel = [r for r in rows if r["per"] == p]
+            d = sum(1 for r in sel if r["s"] != "OK")
+            suf = "  (vista: suma de los dos bloques)" if p == chk.P_FULLYEAR else ""
+            print(f"  {chk.period_label(p):<20}: {len(sel)} lineas, "
+                  f"{d} con desvio{suf}")
+    if meta["periodoFalta"]:
+        print("  (sin apertura: la query no trae el mes, se compara el anio completo)")
     print(f"Tablero           : {out}")
 
 
