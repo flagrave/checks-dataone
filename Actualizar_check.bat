@@ -5,25 +5,33 @@ rem "%~dp0" = la carpeta donde vive este .bat, asi anda aunque la muevas.
 cd /d "%~dp0"
 
 rem ----------------------------------------------------------------
-rem Carpeta compartida donde publicamos el tablero para los owners de
-rem cada negocio. Cambia con cada ciclo de cierre: editar SOLO esta
-rem linea cuando pasemos a la carpeta del ciclo siguiente.
+rem Lo unico que se edita al cambiar de ciclo: estas cinco lineas.
+rem CICLO tiene que coincidir con una clave de CYCLES en check_sbp.py
+rem (hoy: sbp / fc3); LIBRO y TABLERO son los nombres que usa ese ciclo.
+rem DEST es la carpeta compartida donde publicamos para los owners.
 rem ----------------------------------------------------------------
+set "CICLO=fc3"
+set "TITULO=Check FC3 2026  -  actual (ene-ago) y to go (sep-dic)"
+set "LIBRO=ChecksibfFC3.xlsx"
+set "TABLERO=Tablero_FC3_2026.html"
 set "DEST=C:\Users\GMERP\Bayer\Finance BP CS Conosur - Documents\CY26\Closing 2026.08\FC3 2026\Submission\Checks"
 
 echo.
 echo ==========================================================
-echo   Check SBP 2027  -  query SAP BW vs hoja de trabajo
+echo   %TITULO%
 echo ==========================================================
 echo.
-echo Acordate de haber GUARDADO Checksibf.xlsx despues del refresh.
+echo Acordate de haber GUARDADO %LIBRO% despues del refresh.
+echo La hoja "query" tiene que traer el periodo contable (Posting
+echo period) y la hoja de trabajo, los doce meses cargados: de ahi
+echo sale la separacion entre el actual y el to go.
 echo.
 
-py check_sbp.py
+py check_sbp.py --cycle %CICLO%
 if errorlevel 1 goto error
 echo.
 
-py dashboard.py
+py dashboard.py --cycle %CICLO%
 if errorlevel 1 goto error
 echo.
 
@@ -32,7 +40,7 @@ rem Se copia recien aca: si alguno de los dos scripts fallo, ya salimos por
 rem :error y los owners siguen viendo la ultima version buena.
 if not exist "%DEST%\" goto nodest
 
-copy /y "Tablero_SBP2027.html" "%DEST%\Tablero_SBP2027.html" >nul
+copy /y "%TABLERO%" "%DEST%\%TABLERO%" >nul
 if errorlevel 1 goto nocopy
 
 echo   Publicado en la carpeta compartida:
@@ -57,7 +65,7 @@ echo.
 echo ----------------------------------------------------------
 echo   Listo. Abriendo el tablero...
 echo ----------------------------------------------------------
-start "" "Tablero_SBP2027.html"
+start "" "%TABLERO%"
 echo.
 pause
 exit /b 0
@@ -66,8 +74,9 @@ exit /b 0
 echo.
 echo **********************************************************
 echo   FALLO. Mira el mensaje de arriba. Lo mas comun:
-echo    - Checksibf.xlsx abierto con cambios sin guardar
-echo    - cambio el orden de las columnas de la hoja "query"
+echo    - %LIBRO% abierto con cambios sin guardar
+echo    - la hoja "query" sin la columna del periodo contable
+echo    - cambiaron los titulos de las columnas de la hoja "query"
 echo    - se renombro alguna hoja del libro
 echo **********************************************************
 echo.

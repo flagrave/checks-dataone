@@ -11,7 +11,8 @@
 ~$*
 
 # Salidas que generan los scripts: se reconstruyen corriendo el .bat.
-Tablero_SBP2027.html
+# Llevan cifras del cierre, igual que las entradas.
+Tablero_*.html
 
 # Python
 __pycache__/
